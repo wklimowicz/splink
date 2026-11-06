@@ -93,6 +93,13 @@ typechecking = ["mypy>=2.1.0"]
 typechecking-dev = [
     "ty>=0.0.21",
 ]
+benchmark = [
+    "duckdb==2.0.0",
+    "pandas==2.2.3",
+    "psutil==5.9.4",
+    "pyarrow==21.0.0",
+    "sqlglot==27.13.2",
+]
 
 [tool.uv]
 exclude-newer = "7 days"
