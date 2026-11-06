@@ -22,7 +22,6 @@ from splink.internals.vertically_concatenate import (
 )
 
 from .expectation_maximisation import (
-    compute_new_parameters_sql,
     compute_proportions_for_new_parameters,
 )
 
@@ -235,17 +234,18 @@ def _accumulate_u_counts_from_chunk_and_check_min_count(
 
     pipeline.enqueue_list_of_sqls(comparison_vector_sqls)
 
-    # Add dummy match_probability column required by compute_new_parameters_sql
-    sql = """
-    select *, cast(0.0 as float8) as match_probability
+    # Every sampled pair is a non-match for u-estimation. Count its gamma
+    # directly; EM's probability-weighted m/u and global-prior row are unused.
+    output_name = comparison.output_column_name.replace("'", "''")
+    sql = f"""
+    select
+        {comparison._gamma_column_name} as comparison_vector_value,
+        0.0 as m_count,
+        count(*) as u_count,
+        '{output_name}' as output_column_name
     from __splink__df_comparison_vectors
+    group by {comparison._gamma_column_name}
     """
-    pipeline.enqueue_sql(sql, "__splink__df_predict")
-
-    sql = compute_new_parameters_sql(
-        estimate_without_term_frequencies=False,
-        comparisons=[comparison],
-    )
     pipeline.enqueue_sql(sql, "__splink__m_u_counts")
 
     df_params = db_api.sql_pipeline_to_splink_dataframe(pipeline)
