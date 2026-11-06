@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from copy import deepcopy
+from contextlib import contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, List
 
@@ -327,6 +328,35 @@ def _proportion_sample_size_link_only(
     return proportion, sample_size
 
 
+
+@contextmanager
+def _u_sample_with_arrow_batches(db_api, df_sample):
+    """Expose only the sampled rows as small DuckDB Arrow scan tasks.
+
+    Both dedupe and two-input link-only pipelines consume the same logical sample;
+    their existing splitting, hashing, chunking and early-stop SQL is unchanged.
+    """
+    arrow_name = None
+    try:
+        if db_api.sql_dialect.sql_dialect_str == "duckdb":
+            import pyarrow as pa
+
+            sample = df_sample.as_pyarrow_table().combine_chunks()
+            batches = sample.to_batches(max_chunksize=64)
+            sample = pa.Table.from_batches(batches, schema=sample.schema)
+            arrow_name = f"__splink__u_arrow_{ascii_uid(8)}"
+            db_api.duckdb_con.register(arrow_name, sample)
+            yield db_api.table_to_splink_dataframe(
+                "__splink__df_concat_sample", arrow_name
+            )
+        else:
+            yield df_sample
+    finally:
+        if arrow_name is not None:
+            db_api.duckdb_con.unregister(arrow_name)
+        df_sample.drop_table_from_database_and_remove_from_cache()
+
+
 def estimate_u_values(
     linker: Linker,
     max_pairs: float,
@@ -420,141 +450,140 @@ def estimate_u_values(
     pipeline.enqueue_sql(sql, "__splink__df_concat_sample")
     df_sample = db_api.sql_pipeline_to_splink_dataframe(pipeline)
 
-    input_tablename_sample_l = "__splink__df_concat_sample"
-    input_tablename_sample_r = "__splink__df_concat_sample"
+    with _u_sample_with_arrow_batches(db_api, df_sample) as df_sample:
+        input_tablename_sample_l = "__splink__df_concat_sample"
+        input_tablename_sample_r = "__splink__df_concat_sample"
 
-    split_sqls: list[dict[str, str]] = []
+        split_sqls: list[dict[str, str]] = []
 
-    if (
-        len(linker._input_tables_dict) == 2
-        and linker._settings_obj._link_type == "link_only"
-    ):
-        split_sqls = split_df_concat_with_tf_into_two_tables_sqls(
-            "__splink__df_concat",
-            linker._settings_obj.column_info_settings.source_dataset_column_name,
-            sample_switch=True,
-        )
-        input_tablename_sample_l = "__splink__df_concat_sample_left"
-        input_tablename_sample_r = "__splink__df_concat_sample_right"
+        if (
+            len(linker._input_tables_dict) == 2
+            and linker._settings_obj._link_type == "link_only"
+        ):
+            split_sqls = split_df_concat_with_tf_into_two_tables_sqls(
+                "__splink__df_concat",
+                linker._settings_obj.column_info_settings.source_dataset_column_name,
+                sample_switch=True,
+            )
+            input_tablename_sample_l = "__splink__df_concat_sample_left"
+            input_tablename_sample_r = "__splink__df_concat_sample_right"
 
-    # At this point we've computed our data sample and we're ready to 'block and count'
+        # At this point we've computed our data sample and we're ready to 'block and count'
 
-    # Only chunk on RHS.  Input data is sample and thus always small enough.
-    rhs_num_chunks = num_chunks
+        # Only chunk on RHS.  Input data is sample and thus always small enough.
+        rhs_num_chunks = num_chunks
 
-    uid_columns = settings_obj.column_info_settings.unique_id_input_columns
+        uid_columns = settings_obj.column_info_settings.unique_id_input_columns
 
-    common_blocking_cols: list[str] = []
-    for uid_column in uid_columns:
-        common_blocking_cols.extend(uid_column.l_r_names_as_l_r)
+        common_blocking_cols: list[str] = []
+        for uid_column in uid_columns:
+            common_blocking_cols.extend(uid_column.l_r_names_as_l_r)
 
-    for i, comparison in enumerate(settings_obj.comparisons):
-        logger.info(
-            f"\nEstimating u for: {comparison.output_column_name} "
-            f"(Comparison {i + 1} of {len(settings_obj.comparisons)})"
-        )
-        original_comparison = original_settings_obj.comparisons[i]
+        for i, comparison in enumerate(settings_obj.comparisons):
+            logger.info(
+                f"\nEstimating u for: {comparison.output_column_name} "
+                f"(Comparison {i + 1} of {len(settings_obj.comparisons)})"
+            )
+            original_comparison = original_settings_obj.comparisons[i]
 
-        counts_accumulator = _MUCountsAccumulator(comparison)
+            counts_accumulator = _MUCountsAccumulator(comparison)
 
-        # Blocking needs UIDs + comparison-specific columns
-        blocking_cols = (
-            common_blocking_cols + comparison._columns_to_select_for_blocking()
-        )
-
-        # Comparison vector needs UIDs + comparison output + match_key
-        cv_cols = Settings.columns_to_select_for_comparison_vector_values(
-            unique_id_input_columns=uid_columns,
-            comparisons=[comparison],
-            retain_matching_columns=False,
-            additional_columns_to_retain=[],
-        )
-
-        use_probe = rhs_num_chunks > 1
-
-        # Bind invariant args once to avoid repetition
-        run_chunk = partial(
-            _accumulate_u_counts_from_chunk_and_check_min_count,
-            db_api=db_api,
-            df_sample=df_sample,
-            split_sqls=split_sqls,
-            input_tablename_sample_l=input_tablename_sample_l,
-            input_tablename_sample_r=input_tablename_sample_r,
-            link_type=linker._settings_obj._link_type,
-            source_dataset_input_column=settings_obj.column_info_settings.source_dataset_input_column,
-            unique_id_input_column=settings_obj.column_info_settings.unique_id_input_column,
-            comparison=comparison,
-            blocking_cols=blocking_cols,
-            cv_cols=cv_cols,
-            min_count_per_level=min_count_per_level,
-        )
-
-        min_count_condition_met = False
-        if use_probe:
-            probe_multiplier = 10
-            probe_rhs_num_chunks = rhs_num_chunks * probe_multiplier
-            min_count_condition_met = run_chunk(
-                rhs_chunk_num=1,
-                rhs_num_chunks=probe_rhs_num_chunks,
-                counts_accumulator=counts_accumulator,
-                probe_percent_of_max_pairs=100.0 / (rhs_num_chunks * probe_multiplier),
+            # Blocking needs UIDs + comparison-specific columns
+            blocking_cols = (
+                common_blocking_cols + comparison._columns_to_select_for_blocking()
             )
 
-        if not min_count_condition_met:
+            # Comparison vector needs UIDs + comparison output + match_key
+            cv_cols = Settings.columns_to_select_for_comparison_vector_values(
+                unique_id_input_columns=uid_columns,
+                comparisons=[comparison],
+                retain_matching_columns=False,
+                additional_columns_to_retain=[],
+            )
+
+            use_probe = rhs_num_chunks > 1
+
+            # Bind invariant args once to avoid repetition
+            run_chunk = partial(
+                _accumulate_u_counts_from_chunk_and_check_min_count,
+                db_api=db_api,
+                df_sample=df_sample,
+                split_sqls=split_sqls,
+                input_tablename_sample_l=input_tablename_sample_l,
+                input_tablename_sample_r=input_tablename_sample_r,
+                link_type=linker._settings_obj._link_type,
+                source_dataset_input_column=settings_obj.column_info_settings.source_dataset_input_column,
+                unique_id_input_column=settings_obj.column_info_settings.unique_id_input_column,
+                comparison=comparison,
+                blocking_cols=blocking_cols,
+                cv_cols=cv_cols,
+                min_count_per_level=min_count_per_level,
+            )
+
+            min_count_condition_met = False
             if use_probe:
-                logger.info(
-                    "  Probe did not converge; restarting with normal chunking\n"
-                )
-                counts_accumulator = _MUCountsAccumulator(comparison)
-
-            for rhs_chunk_num in range(1, rhs_num_chunks + 1):
+                probe_multiplier = 10
+                probe_rhs_num_chunks = rhs_num_chunks * probe_multiplier
                 min_count_condition_met = run_chunk(
-                    rhs_chunk_num=rhs_chunk_num,
-                    rhs_num_chunks=rhs_num_chunks,
+                    rhs_chunk_num=1,
+                    rhs_num_chunks=probe_rhs_num_chunks,
                     counts_accumulator=counts_accumulator,
+                    probe_percent_of_max_pairs=100.0 / (rhs_num_chunks * probe_multiplier),
                 )
-                if min_count_condition_met and (min_count_per_level is not None):
-                    break
 
-        aggregated_counts_df = counts_accumulator.to_record_list()
-        aggregated_counts_sdf = db_api.register(
-            aggregated_counts_df,
-            table_name=f"__splink__aggregated_m_u_counts_{ascii_uid(8)}",
-        )
+            if not min_count_condition_met:
+                if use_probe:
+                    logger.info(
+                        "  Probe did not converge; restarting with normal chunking\n"
+                    )
+                    counts_accumulator = _MUCountsAccumulator(comparison)
 
-        # Convert aggregated counts to proportions (u probabilities)
-        param_records = compute_proportions_for_new_parameters(aggregated_counts_sdf)
-        aggregated_counts_sdf.drop_table_from_database_and_remove_from_cache(
-            force_non_splink_table=True
-        )
+                for rhs_chunk_num in range(1, rhs_num_chunks + 1):
+                    min_count_condition_met = run_chunk(
+                        rhs_chunk_num=rhs_chunk_num,
+                        rhs_num_chunks=rhs_num_chunks,
+                        counts_accumulator=counts_accumulator,
+                    )
+                    if min_count_condition_met and (min_count_per_level is not None):
+                        break
 
-        # Handling of unobserved levels is consistent with splink 4
-        # 'LEVEL_NOT_OBSERVED_TEXT' behaviour whilst enabling the 'break early' check
-        # - We explicitly include every level (via enumeration) so that convergence
-        #   checks can treat missing GROUP BY rows as 0 counts.
-        # - But for the final trained u values, a level with u_count == 0 should be
-        #   treated as "not observed" (not as u_probability = 0.0).
-        u_count_by_cvv = {
-            int(row["comparison_vector_value"]): float(row["u_count"])
-            for row in aggregated_counts_df
-        }
-        for r in param_records:
-            cvv = int(r["comparison_vector_value"])
-            if u_count_by_cvv.get(cvv, 0.0) == 0.0:
-                r["u_probability"] = LEVEL_NOT_OBSERVED_TEXT
-
-        m_u_records = param_records
-        m_u_records_lookup = m_u_records_to_lookup_dict(m_u_records)
-
-        # Apply estimated u values to the original settings object
-        for cl in original_comparison._comparison_levels_excluding_null:
-            append_u_probability_to_comparison_level_trained_probabilities(
-                cl,
-                m_u_records_lookup,
-                original_comparison.output_column_name,
-                "estimate u by random sampling",
+            aggregated_counts_df = counts_accumulator.to_record_list()
+            aggregated_counts_sdf = db_api.register(
+                aggregated_counts_df,
+                table_name=f"__splink__aggregated_m_u_counts_{ascii_uid(8)}",
             )
 
-    df_sample.drop_table_from_database_and_remove_from_cache()
+            # Convert aggregated counts to proportions (u probabilities)
+            param_records = compute_proportions_for_new_parameters(aggregated_counts_sdf)
+            aggregated_counts_sdf.drop_table_from_database_and_remove_from_cache(
+                force_non_splink_table=True
+            )
+
+            # Handling of unobserved levels is consistent with splink 4
+            # 'LEVEL_NOT_OBSERVED_TEXT' behaviour whilst enabling the 'break early' check
+            # - We explicitly include every level (via enumeration) so that convergence
+            #   checks can treat missing GROUP BY rows as 0 counts.
+            # - But for the final trained u values, a level with u_count == 0 should be
+            #   treated as "not observed" (not as u_probability = 0.0).
+            u_count_by_cvv = {
+                int(row["comparison_vector_value"]): float(row["u_count"])
+                for row in aggregated_counts_df
+            }
+            for r in param_records:
+                cvv = int(r["comparison_vector_value"])
+                if u_count_by_cvv.get(cvv, 0.0) == 0.0:
+                    r["u_probability"] = LEVEL_NOT_OBSERVED_TEXT
+
+            m_u_records = param_records
+            m_u_records_lookup = m_u_records_to_lookup_dict(m_u_records)
+
+            # Apply estimated u values to the original settings object
+            for cl in original_comparison._comparison_levels_excluding_null:
+                append_u_probability_to_comparison_level_trained_probabilities(
+                    cl,
+                    m_u_records_lookup,
+                    original_comparison.output_column_name,
+                    "estimate u by random sampling",
+                )
 
     logger.info("\nEstimated u probabilities using random sampling")
