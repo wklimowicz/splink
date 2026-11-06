@@ -344,7 +344,7 @@ def _u_sample_with_arrow_batches(db_api, df_sample):
             sample = df_sample.as_pyarrow_table().combine_chunks()
             batches = sample.to_batches(max_chunksize=64)
             sample = pa.Table.from_batches(batches, schema=sample.schema)
-            arrow_name = f"__splink__u_arrow_{ascii_uid(8)}"
+            arrow_name = f"__splink__df_concat_sample_{ascii_uid(8)}"
             db_api.duckdb_con.register(arrow_name, sample)
             yield db_api.table_to_splink_dataframe(
                 "__splink__df_concat_sample", arrow_name
